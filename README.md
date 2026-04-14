@@ -1,51 +1,48 @@
-# marketplace-stock-sync
+# 🛒 Multi-Channel Inventory Sync (Mercado Libre + Tiendanube)
 
-> **Suggested repository rename:** `marketplace-stock-sync` (current: `IntegradorML`).
-
-Real-time stock synchronization service between Mercado Libre and Tiendanube to prevent overselling, built for commerce operations teams that manage inventory across multiple sales channels.
+Real-time stock synchronization platform designed to eliminate overselling and unify inventory across multiple marketplaces.
 
 ## Problem
-When Mercado Libre and Tiendanube inventory were managed independently, stock updates arrived at different times and created overselling risk. This operational gap impacted fulfillment reliability, customer trust, and support workload.
+Inventory was managed independently in Mercado Libre and Tiendanube, causing delays in updates and frequent overselling. This impacted fulfillment reliability, customer experience, and operational efficiency.
 
 ## Solution
-This project implements a centralized stock engine with webhook-driven updates, idempotent processing, and bidirectional propagation to both marketplaces. A single source of truth in PostgreSQL ensures consistent availability across channels.
+I built a centralized stock system that synchronizes inventory in real time across both platforms using webhooks, idempotent processing, and a single source of truth.
 
 ## Technologies
-- **Frontend:** React (Vite)
-- **Backend:** Express.js (Node.js)
-- **Data layer:** PostgreSQL (via Supabase)
-- **Integrations:** Mercado Libre API, Tiendanube API
-- **Automation:** Scheduled synchronization jobs + webhook processing
+- React (Vite)
+- Node.js / Express
+- PostgreSQL (Supabase)
+- Mercado Libre API
+- Tiendanube API
 
 ## Key Features
-- Unified SKU catalog with a master stock value
-- Webhook endpoints for Mercado Libre and Tiendanube events
-- Idempotency guard to avoid duplicate stock movements
-- Automated stock propagation to both marketplaces after each change
-- Stock ledger for auditability and traceability of every adjustment
-- Auth-protected operational endpoints for internal usage
+- Centralized stock management across multiple marketplaces
+- Real-time synchronization via webhooks
+- Idempotency system to prevent duplicate stock updates
+- Automated stock propagation after every change
+- Stock tracking and auditability
+- Secure internal endpoints for operations
 
 ## Impact
-- **Overselling reduced to 0** after synchronization rollout
-- Faster and safer multi-channel inventory operations
-- Improved confidence for sales and fulfillment teams through consistent stock visibility
+- Eliminated overselling (**reduced to 0**)
+- Improved operational reliability and fulfillment accuracy
+- Reduced manual intervention and support workload
+- Enabled scalable multi-channel inventory management
 
 ## Status
-**Production-like real implementation** used to solve a live business problem.
+Production-ready solution used in a real business environment.
 
-### My Role
-I owned the full implementation end-to-end:
-- System design and architecture decisions
-- API integrations (Mercado Libre + Tiendanube)
+## My Role
+Full ownership of the project:
+- System architecture and design
+- API integrations (Mercado Libre & Tiendanube)
 - Stock synchronization logic and idempotency strategy
-- Database modeling and operational endpoints
+- Database modeling and operational workflows
 
 ## Demo
 No public demo available (private business integration).
 
 ## Installation
-Use this section only if you want to run the project locally for technical review.
-
 ```bash
 # Backend
 npm install
@@ -56,9 +53,3 @@ npm run dev
 cd frontend
 npm install
 npm run dev
-```
-
----
-
-## GitHub Repository Description (1 line)
-Real-time Mercado Libre + Tiendanube inventory sync platform that eliminated overselling through webhook-driven, idempotent stock orchestration.
