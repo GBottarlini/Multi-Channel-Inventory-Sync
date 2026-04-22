@@ -247,6 +247,202 @@ async function getTnItemsBySku(sku) {
   }
 }
 
+async function pushSkuStockToPlatforms({ sku, stock }) {
+  // MercadoLibre
+  const itemIdsToUpdateML = await getMlItemsBySku(sku);
+  if (itemIdsToUpdateML.length > 0) {
+    console.log(
+      `[Stock Sync] Encontrados ${itemIdsToUpdateML.length} items de ML para SKU ${sku}. Actualizando stock a ${stock}...`
+    );
+    await Promise.all(itemIdsToUpdateML.map((itemId) => updateMlItemStock(itemId, stock)));
+  }
+
+  // TiendaNube
+  const itemsToUpdateTN = await getTnItemsBySku(sku);
+  if (itemsToUpdateTN.length > 0) {
+    console.log(
+      `[Stock Sync] Encontrados ${itemsToUpdateTN.length} items de TN para SKU ${sku}. Actualizando stock a ${stock}...`
+    );
+    await Promise.all(
+      itemsToUpdateTN.map(({ product_id, variant_id }) =>
+        updateTnItemStock(product_id, variant_id, stock)
+      )
+    );
+  }
+}
+
+async function pushSaleUnitStock({ channel, externalId, stock }) {
+  if (channel === "ml") {
+    await updateMlItemStock(externalId, stock);
+    return;
+  }
+  if (channel === "tn") {
+    const [productIdRaw, variantIdRaw] = String(externalId).split(":");
+    const productId = Number(productIdRaw);
+    const variantId = Number(variantIdRaw);
+    if (!Number.isFinite(productId) || !Number.isFinite(variantId)) {
+      console.warn(
+        `[Stock Sync] external_id TN invalido '${externalId}' (esperado product_id:variant_id).`
+      );
+      return;
+    }
+    await updateTnItemStock(productId, variantId, stock);
+  }
+}
+
+async function pushDerivedSaleUnitsForComponentSkus(componentSkus = []) {
+  const unique = Array.from(new Set(componentSkus.filter(Boolean)));
+  if (unique.length === 0) return;
+
+  // sale_units que dependen de alguno de estos componentes
+  const { rows: units } = await pool.query(
+    `
+    SELECT DISTINCT su.id, su.channel, su.external_id
+    FROM sale_units su
+    JOIN sale_unit_components suc
+      ON suc.sale_unit_id = su.id
+    WHERE suc.component_sku = ANY($1::text[])
+    `,
+    [unique]
+  );
+
+  for (const u of units) {
+    const { rows: comps } = await pool.query(
+      `
+      SELECT suc.component_sku, suc.qty, s.stock
+      FROM sale_unit_components suc
+      JOIN skus s ON s.sku = suc.component_sku
+      WHERE suc.sale_unit_id = $1
+      `,
+      [u.id]
+    );
+
+    if (comps.length === 0) continue;
+
+    let derived = Infinity;
+    for (const c of comps) {
+      const qty = Number(c.qty);
+      const stock = Number(c.stock);
+      if (!Number.isFinite(qty) || qty <= 0) continue;
+      if (!Number.isFinite(stock) || stock < 0) continue;
+      derived = Math.min(derived, Math.floor(stock / qty));
+    }
+
+    if (!Number.isFinite(derived) || derived === Infinity) continue;
+
+    await pushSaleUnitStock({
+      channel: u.channel,
+      externalId: u.external_id,
+      stock: Math.max(derived, 0),
+    });
+  }
+}
+
+async function applyStockDeltaInTx(client, { sku, delta, reason, ref = null }) {
+  const safeDelta = Number(delta);
+  if (!Number.isFinite(safeDelta) || safeDelta === 0) {
+    return { applied: false, sku, stock: null, skipped: "invalid_delta" };
+  }
+
+  const insertRes = await client.query(
+    `
+    INSERT INTO stock_ledger (sku, delta, reason, ref)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (sku, reason, ref) WHERE ref IS NOT NULL
+    DO NOTHING
+    RETURNING id
+    `,
+    [sku, safeDelta, reason, ref]
+  );
+
+  if (insertRes.rowCount === 0) {
+    return { applied: false, sku, stock: null, skipped: "idempotent_conflict" };
+  }
+
+  const updateRes = await client.query(
+    `
+    UPDATE skus
+    SET
+      stock = GREATEST(stock + $2, 0),
+      is_initialized = true,
+      updated_at = now()
+    WHERE sku = $1
+    RETURNING sku, stock
+    `,
+    [sku, safeDelta]
+  );
+
+  if (updateRes.rowCount === 0) {
+    throw new Error(`El SKU '${sku}' no existe.`);
+  }
+
+  return { applied: true, sku: updateRes.rows[0].sku, stock: updateRes.rows[0].stock };
+}
+
+/**
+ * Aplica un delta de stock de forma atómica e idempotente.
+ * - Inserta en stock_ledger con ON CONFLICT DO NOTHING
+ * - Si insertó, actualiza skus.stock con clamp a 0 e is_initialized=true
+ * Todo dentro de una transacción.
+ */
+export async function applyStockDelta({ sku, delta, reason, ref = null }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await applyStockDeltaInTx(client, { sku, delta, reason, ref });
+    await client.query("COMMIT");
+
+    if (result.applied) {
+      await pushSkuStockToPlatforms({ sku: result.sku, stock: result.stock });
+      await pushDerivedSaleUnitsForComponentSkus([result.sku]);
+    }
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Aplica múltiples deltas en UNA única transacción (para órdenes).
+ * Devuelve los SKUs efectivamente actualizados (para logging/propagación).
+ */
+export async function applyStockDeltas(deltas = []) {
+  const items = Array.isArray(deltas) ? deltas : [];
+  if (items.length === 0) return { updated: [] };
+
+  const client = await pool.connect();
+  const updated = [];
+
+  try {
+    await client.query("BEGIN");
+
+    for (const d of items) {
+      const r = await applyStockDeltaInTx(client, d);
+      if (r.applied) updated.push({ sku: r.sku, stock: r.stock });
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  // Propagación post-commit
+  for (const u of updated) {
+    await pushSkuStockToPlatforms(u);
+  }
+
+  // Si un componente cambió, puede impactar kits/BOM por listing.
+  await pushDerivedSaleUnitsForComponentSkus(updated.map((u) => u.sku));
+
+  return { updated };
+}
+
 /**
  * Verifica si ya existe un movimiento de stock para un SKU y referencia.
  * @param {object} params
@@ -311,7 +507,7 @@ export async function updateStock({ sku, stock, reason, notes = null }) {
     const delta = stock - oldStock;
 
     const updatedSkuRes = await client.query(
-      "UPDATE skus SET stock = $1, updated_at = now() WHERE sku = $2 RETURNING *",
+      "UPDATE skus SET stock = $1, is_initialized = true, updated_at = now() WHERE sku = $2 RETURNING *",
       [stock, sku]
     );
     updatedSku = updatedSkuRes.rows[0];
@@ -338,43 +534,9 @@ export async function updateStock({ sku, stock, reason, notes = null }) {
 
   // --- Sincronizacion con plataformas (despues del commit) ---
   if (updatedSku) {
-    console.log(
-      `[Stock Sync] DB actualizada para ${sku}. Buscando items en plataformas para sincronizar...`
-    );
-
-    // Sincronizar con MercadoLibre
-    const itemIdsToUpdateML = await getMlItemsBySku(sku);
-    if (itemIdsToUpdateML.length > 0) {
-      console.log(
-        `[Stock Sync] Encontrados ${itemIdsToUpdateML.length} items de ML para SKU ${sku}. Actualizando stock a ${stock}...`
-      );
-      const updatePromisesML = itemIdsToUpdateML.map((itemId) =>
-        updateMlItemStock(itemId, stock)
-      );
-      await Promise.all(updatePromisesML);
-      console.log(
-        `[Stock Sync] Proceso de actualizacion para SKU ${sku} en ML finalizado.`
-      );
-    } else {
-      console.log(`[Stock Sync] No se encontraron items de ML para ${sku}.`);
-    }
-
-    // Sincronizar con TiendaNube
-    const itemsToUpdateTN = await getTnItemsBySku(sku);
-    if (itemsToUpdateTN.length > 0) {
-      console.log(
-        `[Stock Sync] Encontrados ${itemsToUpdateTN.length} items de TN para SKU ${sku}. Actualizando stock a ${stock}...`
-      );
-      const updatePromisesTN = itemsToUpdateTN.map(({ product_id, variant_id }) =>
-        updateTnItemStock(product_id, variant_id, stock)
-      );
-      await Promise.all(updatePromisesTN);
-      console.log(
-        `[Stock Sync] Proceso de actualizacion para SKU ${sku} en TN finalizado.`
-      );
-    } else {
-      console.log(`[Stock Sync] No se encontraron items de TN para ${sku}.`);
-    }
+    console.log(`[Stock Sync] DB actualizada para ${sku}. Sincronizando plataformas...`);
+    await pushSkuStockToPlatforms({ sku, stock });
+    await pushDerivedSaleUnitsForComponentSkus([sku]);
   }
 
   return updatedSku;

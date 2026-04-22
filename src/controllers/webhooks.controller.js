@@ -1,7 +1,12 @@
 // src/controllers/webhooks.controller.js
 import crypto from "crypto";
-import { getSkuBySku, updateStock } from "../services/stock.service.js";
+import { applyStockDeltas } from "../services/stock.service.js";
 import { getOrderByResourceUrl } from "../services/mercadolibre.service.js";
+import {
+  getSaleUnitWithComponents,
+  getSkuByMlItemId,
+  getSkuByTnIds,
+} from "../services/saleUnits.service.js";
 import { env } from "../config/env.js";
 
 async function getOrderData(resourceUrl) {
@@ -27,6 +32,9 @@ function safeCompareSignature(a, b) {
 function verifyTnWebhook(req) {
   const secret = env.tiendaNubeWebhookSecret || env.tiendaNubeClientSecret;
   if (!secret) {
+    if (env.nodeEnv === "production") {
+      return { ok: false, reason: "missing_secret" };
+    }
     return { ok: true, skipped: true };
   }
 
@@ -58,7 +66,9 @@ function verifyTnWebhook(req) {
 
 export async function handleMlWebhook(req, res) {
   const { body } = req;
-  console.log("[ML Webhook] Notificacion recibida:", JSON.stringify(body, null, 2));
+  console.log(
+    `[ML Webhook] Notificacion recibida. topic='${body?.topic}' resource='${body?.resource}'`
+  );
 
   // ML envia un ping de prueba al crear el webhook.
   if (body.topic === "test_topic") {
@@ -78,7 +88,9 @@ export async function handleMlWebhook(req, res) {
   // --- Procesamiento asincrono ---
   try {
     const order = await getOrderData(body.resource);
-    console.log("[ML Webhook] Orden obtenida:", JSON.stringify(order, null, 2));
+    console.log(
+      `[ML Webhook] Orden obtenida. order_id='${order?.id}' status='${order?.status}'`
+    );
 
     if (order.status !== "paid") {
       console.log(`[ML Webhook] Ignorando orden con status '${order.status}'.`);
@@ -89,49 +101,61 @@ export async function handleMlWebhook(req, res) {
       ? order.order_items
       : [];
 
-    for (const item of orderItems) {
-      const sku = item?.item?.seller_sku;
-      const quantitySold = item?.quantity;
+    const deltasBySku = new Map();
+    const orderId = String(order?.id ?? "");
+    const ref = orderId ? `ml:order:${orderId}` : null;
 
-      if (!sku) {
+    for (const line of orderItems) {
+      const itemId = String(line?.item?.id ?? "");
+      const purchasedQty = Number(line?.quantity);
+      const fallbackSku = line?.item?.seller_sku ? String(line.item.seller_sku) : null;
+
+      if (!itemId) {
+        console.warn(`[ML Webhook] Linea sin item_id en orden ${orderId}. Ignorando.`);
+        continue;
+      }
+      if (!Number.isFinite(purchasedQty) || purchasedQty <= 0) {
         console.warn(
-          `[ML Webhook] Item ${item?.item?.id} en orden ${order.id} no tiene SKU. Ignorando.`
+          `[ML Webhook] Linea item_id=${itemId} en orden ${orderId} sin cantidad valida. Ignorando.`
         );
         continue;
       }
 
-      if (!Number.isFinite(quantitySold)) {
+      const saleUnit = await getSaleUnitWithComponents({ channel: "ml", externalId: itemId });
+
+      let components = saleUnit?.components ?? [];
+      if (components.length === 0) {
+        const linkedSku = saleUnit?.linked_sku || fallbackSku || (await getSkuByMlItemId(itemId));
+        if (linkedSku) {
+          components = [{ component_sku: linkedSku, qty: 1 }];
+        }
+      }
+
+      if (components.length === 0) {
         console.warn(
-          `[ML Webhook] Item ${item?.item?.id} en orden ${order.id} sin cantidad valida. Ignorando.`
+          `[ML Webhook] Sin mapeo de SKU/BOM para item_id=${itemId} en orden ${orderId}.`
         );
         continue;
       }
 
-      console.log(`[ML Webhook] Procesando venta: ${quantitySold}x SKU ${sku}`);
+      for (const c of components) {
+        const componentSku = c.component_sku;
+        const qty = Number(c.qty);
+        if (!componentSku || !Number.isFinite(qty) || qty <= 0) continue;
 
-      // 1. Obtener stock actual de nuestra DB
-      const skuData = await getSkuBySku(sku);
-      if (!skuData) {
-        console.error(
-          `[ML Webhook] SKU ${sku} de la venta no existe en nuestra base de datos. No se puede actualizar stock.`
-        );
-        continue;
+        const delta = -qty * purchasedQty;
+        deltasBySku.set(componentSku, (deltasBySku.get(componentSku) || 0) + delta);
       }
-      const currentStock = skuData.stock;
-      const newStock = currentStock - quantitySold;
-
-      // 2. Actualizar stock en DB y propagar a las plataformas
-      await updateStock({
-        sku,
-        stock: newStock,
-        reason: "sale_ml",
-        notes: `order_id:${order.id}`,
-      });
-
-      console.log(
-        `[ML Webhook] Stock para SKU ${sku} actualizado de ${currentStock} a ${newStock}.`
-      );
     }
+
+    const deltas = Array.from(deltasBySku.entries())
+      .filter(([, delta]) => Number.isFinite(delta) && delta !== 0)
+      .map(([sku, delta]) => ({ sku, delta, reason: "sale_ml", ref }));
+
+    const result = await applyStockDeltas(deltas);
+    console.log(
+      `[ML Webhook] Orden ${orderId} aplicada. skus_actualizados=${result.updated.length}`
+    );
   } catch (error) {
     console.error("[ML Webhook] Error procesando la notificacion de orden:", error);
     // El error ya fue logueado, no hacemos nada mas.
@@ -146,16 +170,16 @@ export async function handleTnWebhook(req, res) {
       "[TN Webhook] Firma invalida:",
       verification.reason || "signature_mismatch"
     );
+    if (verification.reason === "missing_secret") {
+      return res.status(500).send("Webhook secret not configured");
+    }
     return res.status(401).send("Invalid signature");
   }
 
   const { body: notification } = req;
   const event = req.get("x-tiendanube-event");
 
-  console.log(
-    `[TN Webhook] Notificacion recibida. Evento: '${event}'`,
-    JSON.stringify(notification, null, 2)
-  );
+  console.log(`[TN Webhook] Notificacion recibida. Evento: '${event}' order_id='${notification?.id}'`);
 
   // Respondemos 200 OK inmediatamente.
   res.status(200).send("OK");
@@ -172,49 +196,70 @@ export async function handleTnWebhook(req, res) {
 
     console.log(`[TN Webhook] Procesando orden pagada ID: ${order.id}`);
 
+    const deltasBySku = new Map();
+    const orderId = String(order?.id ?? "");
+    const ref = orderId ? `tn:order:${orderId}` : null;
+
     for (const product of products) {
-      const sku = product?.sku;
-      const quantitySold = product?.quantity;
+      const productId = product?.product_id;
+      const variantId = product?.variant_id;
+      const externalId =
+        productId != null && variantId != null
+          ? `${productId}:${variantId}`
+          : "";
 
-      if (!sku) {
+      const purchasedQty = Number(product?.quantity);
+      const fallbackSku = product?.sku ? String(product.sku) : null;
+
+      if (!externalId) {
+        console.warn(`[TN Webhook] Linea sin product_id/variant_id en orden ${orderId}. Ignorando.`);
+        continue;
+      }
+      if (!Number.isFinite(purchasedQty) || purchasedQty <= 0) {
         console.warn(
-          `[TN Webhook] Producto ${product?.product_id} en orden ${order.id} no tiene SKU. Ignorando.`
+          `[TN Webhook] Linea external_id=${externalId} en orden ${orderId} sin cantidad valida. Ignorando.`
         );
         continue;
       }
 
-      if (!Number.isFinite(quantitySold)) {
+      const saleUnit = await getSaleUnitWithComponents({ channel: "tn", externalId });
+
+      let components = saleUnit?.components ?? [];
+      if (components.length === 0) {
+        const linkedSku =
+          saleUnit?.linked_sku ||
+          fallbackSku ||
+          (await getSkuByTnIds(productId, variantId));
+        if (linkedSku) {
+          components = [{ component_sku: linkedSku, qty: 1 }];
+        }
+      }
+
+      if (components.length === 0) {
         console.warn(
-          `[TN Webhook] Producto ${product?.product_id} en orden ${order.id} sin cantidad valida. Ignorando.`
+          `[TN Webhook] Sin mapeo de SKU/BOM para external_id=${externalId} en orden ${orderId}.`
         );
         continue;
       }
 
-      console.log(`[TN Webhook] Procesando venta: ${quantitySold}x SKU ${sku}`);
+      for (const c of components) {
+        const componentSku = c.component_sku;
+        const qty = Number(c.qty);
+        if (!componentSku || !Number.isFinite(qty) || qty <= 0) continue;
 
-      // 1. Obtener stock actual de nuestra DB
-      const skuData = await getSkuBySku(sku);
-      if (!skuData) {
-        console.error(
-          `[TN Webhook] SKU ${sku} de la venta no existe en nuestra base de datos. No se puede actualizar stock.`
-        );
-        continue;
+        const delta = -qty * purchasedQty;
+        deltasBySku.set(componentSku, (deltasBySku.get(componentSku) || 0) + delta);
       }
-      const currentStock = skuData.stock;
-      const newStock = currentStock - quantitySold;
-
-      // 2. Actualizar stock en DB y propagar a las plataformas
-      await updateStock({
-        sku,
-        stock: newStock,
-        reason: "sale_tn",
-        notes: `order_id:${order.id}`,
-      });
-
-      console.log(
-        `[TN Webhook] Stock para SKU ${sku} actualizado de ${currentStock} a ${newStock}.`
-      );
     }
+
+    const deltas = Array.from(deltasBySku.entries())
+      .filter(([, delta]) => Number.isFinite(delta) && delta !== 0)
+      .map(([sku, delta]) => ({ sku, delta, reason: "sale_tn", ref }));
+
+    const result = await applyStockDeltas(deltas);
+    console.log(
+      `[TN Webhook] Orden ${orderId} aplicada. skus_actualizados=${result.updated.length}`
+    );
   } catch (error) {
     console.error("[TN Webhook] Error procesando la notificacion de orden:", error);
   }

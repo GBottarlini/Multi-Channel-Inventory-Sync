@@ -82,14 +82,27 @@ export async function syncMlItemsToDb({ mode = "all", limit = 50 } = {}) {
       );
 
       // ✅ MODO INICIAL:
-      // Si el stock maestro está en 0, lo inicializamos con el stock de ML.
+      // Si el stock maestro NO fue inicializado, lo inicializamos con el stock de ML.
       await client.query(
         `
         update skus
-        set stock = $2, updated_at = now()
-        where sku = $1 and stock = 0
+        set stock = $2, is_initialized = true, updated_at = now()
+        where sku = $1 and is_initialized = false
         `,
         [it.sku, Number(it.stock_ml) || 0]
+      );
+
+      // Upsert sale_unit (por listing)
+      // ML: external_id = item_id
+      await client.query(
+        `
+        INSERT INTO sale_units (channel, external_id, external_sku, linked_sku)
+        VALUES ('ml', $1, $2, $3)
+        ON CONFLICT (channel, external_id) DO UPDATE SET
+          external_sku = EXCLUDED.external_sku,
+          linked_sku = EXCLUDED.linked_sku
+        `,
+        [it.item_id, it.sku, it.sku]
       );
     }
 

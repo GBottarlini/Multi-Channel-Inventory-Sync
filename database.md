@@ -2,6 +2,27 @@
 
 This document outlines the database schema for the Nation Stock Integrator.
 
+## Migrations (DB as code)
+
+Este repo ahora incluye migrations SQL en `db/migrations/`.
+
+### Ejecutar en Supabase
+
+1. Abrí **SQL Editor**.
+2. Pegá y ejecutá los archivos en orden (001, 002, 003...).
+
+### Ejecutar via psql
+
+```bash
+psql "$DATABASE_URL" -f db/migrations/001_skus_is_initialized_and_stock_check.sql
+psql "$DATABASE_URL" -f db/migrations/002_idempotency_and_indexes.sql
+psql "$DATABASE_URL" -f db/migrations/003_sale_units_tables.sql
+psql "$DATABASE_URL" -f db/migrations/004_updated_at_triggers.sql
+psql "$DATABASE_URL" -f db/migrations/005_backfill_is_initialized.sql
+```
+
+> Nota: no hay runner automático; la fuente de verdad es SQL.
+
 ## Tables
 
 ### `skus`
@@ -11,6 +32,7 @@ Stores the master stock for each SKU. This is the single source of truth.
 - `sku` (text, primary key)
 - `title` (text)
 - `stock` (integer, default: `0`)
+- `is_initialized` (boolean, default: `false`): evita usar `stock=0` como sentinel en sync inicial.
 - `image_url` (text)
 - `created_at` (timestamptz, default: `now()`)
 - `updated_at` (timestamptz, default: `now()`)
@@ -112,6 +134,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_ledger_sku_reason_ref
   ON stock_ledger (sku, reason, ref)
   WHERE ref IS NOT NULL;
 ```
+
+## Kits / BOM por listing (sale_units)
+
+Para soportar kits por publicación/variante (en vez de solo por SKU), se usan estas tablas:
+
+### `sale_units`
+
+Representa una “unidad de venta” (listing) por canal.
+
+- `channel`: `'ml'` | `'tn'`
+- `external_id`:
+  - ML: `item_id`
+  - TN: `product_id:variant_id`
+- `external_sku`: SKU que expone el canal (si existe)
+- `linked_sku`: SKU interno base (fallback cuando no hay BOM)
+
+### `sale_unit_components`
+
+Define BOM por listing: qué SKUs se consumen y en qué cantidad.
+
+Ejemplo (kit que consume 1x A y 2x B):
+
+```sql
+-- 1) asegurate de tener la sale_unit
+insert into sale_units (channel, external_id, external_sku, linked_sku)
+values ('ml', 'MLA123456', 'KIT-001', 'KIT-001')
+on conflict (channel, external_id) do update set
+  external_sku = excluded.external_sku,
+  linked_sku = excluded.linked_sku;
+
+-- 2) cargá componentes
+insert into sale_unit_components (sale_unit_id, component_sku, qty)
+select su.id, 'COMP-A', 1 from sale_units su where su.channel='ml' and su.external_id='MLA123456'
+on conflict (sale_unit_id, component_sku) do update set qty = excluded.qty;
+
+insert into sale_unit_components (sale_unit_id, component_sku, qty)
+select su.id, 'COMP-B', 2 from sale_units su where su.channel='ml' and su.external_id='MLA123456'
+on conflict (sale_unit_id, component_sku) do update set qty = excluded.qty;
+```
+
+## Recomendación de `ref` (idempotencia)
+
+Para evitar doble procesamiento por reintentos de webhooks:
+
+- ML: `ref = 'ml:order:{orderId}'`
+- TN: `ref = 'tn:order:{orderId}'`
+
+La unicidad se aplica por `(sku, reason, ref)` cuando `ref` no es NULL.
 
 ## SQL to update existing tables
 

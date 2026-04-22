@@ -142,10 +142,63 @@ export async function getItem(itemId) {
  * Trae una orden por URL de recurso (usado por webhooks).
  */
 export async function getOrderByResourceUrl(resourceUrl) {
-  const { data } = await ml.get(resourceUrl, {
+  const safePath = sanitizeMlWebhookResource(resourceUrl);
+
+  const { data } = await ml.get(safePath, {
     headers: await authHeaders(),
   });
   return data;
+}
+
+/**
+ * SSRF guard: MercadoLibre manda `resource` en el webhook.
+ * Aceptamos solo:
+ *  - rutas relativas permitidas (e.g. /orders/...) o
+ *  - URLs absolutas hacia api.mercadolibre.com con path permitido.
+ *
+ * Devuelve un path seguro para usar con el axios instance (baseURL).
+ */
+export function sanitizeMlWebhookResource(resource) {
+  const raw = String(resource ?? "").trim();
+  if (!raw) {
+    throw new Error("ML webhook resource vacio");
+  }
+
+  const isAbsolute = /^https?:\/\//i.test(raw);
+  if (!isAbsolute) {
+    if (!raw.startsWith("/")) {
+      throw new Error("ML webhook resource invalido (no es path absoluto)");
+    }
+    assertAllowedMlPath(raw);
+    return raw;
+  }
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("ML webhook resource invalido (URL malformada)");
+  }
+
+  if (url.protocol !== "https:") {
+    throw new Error("ML webhook resource invalido (solo https)");
+  }
+  if (url.hostname !== "api.mercadolibre.com") {
+    throw new Error("ML webhook resource invalido (host no permitido)");
+  }
+
+  const pathWithQuery = `${url.pathname}${url.search || ""}`;
+  assertAllowedMlPath(url.pathname);
+  return pathWithQuery;
+}
+
+function assertAllowedMlPath(pathname) {
+  // Ajustar si el proyecto empieza a consumir otros recursos.
+  const allowedPrefixes = ["/orders/"];
+  const ok = allowedPrefixes.some((p) => pathname.startsWith(p));
+  if (!ok) {
+    throw new Error("ML webhook resource invalido (path no permitido)");
+  }
 }
 
 /**

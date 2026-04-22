@@ -63,14 +63,28 @@ export async function syncTnItemsToDb() {
       );
 
       // ✅ MODO INICIAL:
-      // Si el stock maestro está en 0, lo inicializamos con el stock de TN.
+      // Si el stock maestro NO fue inicializado, lo inicializamos con el stock de TN.
       await client.query(
         `
         update skus
-        set stock = $2, updated_at = now()
-        where sku = $1 and stock = 0
+        set stock = $2, is_initialized = true, updated_at = now()
+        where sku = $1 and is_initialized = false
         `,
         [v.sku, Number(v.stock_tn) || 0]
+      );
+
+      // Upsert sale_unit (por variante)
+      // TN: external_id = product_id:variant_id
+      const externalId = `${v.product_id}:${v.variant_id}`;
+      await client.query(
+        `
+        INSERT INTO sale_units (channel, external_id, external_sku, linked_sku)
+        VALUES ('tn', $1, $2, $3)
+        ON CONFLICT (channel, external_id) DO UPDATE SET
+          external_sku = EXCLUDED.external_sku,
+          linked_sku = EXCLUDED.linked_sku
+        `,
+        [externalId, v.sku, v.sku]
       );
     }
 

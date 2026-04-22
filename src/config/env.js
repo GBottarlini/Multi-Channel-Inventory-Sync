@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 export const env = {
+  nodeEnv: process.env.NODE_ENV || "development",
   port: Number(process.env.PORT || 3000),
   mlAccessToken: process.env.ML_ACCESS_TOKEN,
   mlClientId: process.env.ML_CLIENT_ID,
